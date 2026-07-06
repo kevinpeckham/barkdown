@@ -1,0 +1,24 @@
+{
+	"$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/rule-pack-schema.json",
+	"version": 1,
+	"name": "barkdown-house-rules",
+	"description": "House rules for `fallow guard` / `fallow audit`. barkdown's runtime surface is the declared marked peer pair and nothing else — these rules keep src/ free of Node builtins and direct DOM-library imports (all DOM access goes through the adapter seam).",
+	"rules": [
+		{
+			"id": "no-node-builtins-in-core",
+			"kind": "banned-import",
+			"specifiers": ["node:*", "fs", "path", "os", "crypto", "util"],
+			"paths": ["src/**"],
+			"message": "Core must stay platform-neutral: no Node builtins in src/. DOM access goes through the DomAdapter seam.",
+			"severity": "error"
+		},
+		{
+			"id": "no-dom-libs-in-core",
+			"kind": "banned-import",
+			"specifiers": ["linkedom", "jsdom", "happy-dom"],
+			"paths": ["src/**"],
+			"message": "No hard runtime dependency on any DOM library. Consumers pass their own document via documentAdapter(); happy-dom and linkedom are devDependencies for tests only.",
+			"severity": "error"
+		}
+	]
+}

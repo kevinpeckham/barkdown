@@ -1,0 +1,74 @@
+{
+	"name": "@kevinpeckham/barkdown",
+	"version": "0.1.0",
+	"description": "Markdown ⇄ DOM round-trip codec, guaranteed to invert marked. Canonical identity, fixed-point convergence, footnote fidelity, and no silent loss — the serializer half of an editable-markdown pipeline.",
+	"author": "Kevin Peckham",
+	"license": "MIT",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"sideEffects": false,
+	"scripts": {
+		"audit": "bunx fallow audit",
+		"build": "tsc -p tsconfig.build.json",
+		"check": "tsc --noEmit",
+		"format": "bunx biome format --write .",
+		"health": "bunx fallow health",
+		"lint": "bunx biome lint --write .",
+		"prepublishOnly": "bun run check && bun test && bun run build",
+		"test": "bun test"
+	},
+	"keywords": [
+		"markdown",
+		"marked",
+		"serializer",
+		"round-trip",
+		"contenteditable",
+		"wysiwyg",
+		"gfm",
+		"footnotes",
+		"dom",
+		"codec"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kevinpeckham/barkdown.git"
+	},
+	"homepage": "https://github.com/kevinpeckham/barkdown",
+	"peerDependencies": {
+		"marked": "^18.0.0",
+		"marked-footnote": "^1.4.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.1",
+		"@types/bun": "^1.3.14",
+		"fallow": "^3.0.0",
+		"fast-check": "^3.23.0",
+		"happy-dom": "^20.10.6",
+		"linkedom": "^0.18.5",
+		"marked": "^18.0.5",
+		"marked-footnote": "^1.4.0",
+		"typescript": "^5.7.0",
+		"varlock": "^1.9.0"
+	},
+	"engines": {
+		"node": ">=18"
+	},
+	"bugs": {
+		"url": "https://github.com/kevinpeckham/barkdown/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
