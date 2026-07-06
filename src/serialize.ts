@@ -97,6 +97,12 @@ function serializeBlockNode(node: DomNodeLike): string {
 			return serializeCodeBlock(el);
 		case "hr":
 			return "---";
+		case "table":
+			return serializeTable(el);
+		case "img":
+			// A bare block-level image (contenteditable artifact); marked
+			// re-wraps it in a paragraph, which serializes back identically.
+			return serializeImage(el);
 		case "section":
 			if (el.hasAttribute("data-footnotes")) return serializeFootnotes(el);
 			return el.outerHTML;
@@ -162,6 +168,9 @@ function serializeInline(
 			case "code":
 				// Inline code — no escaping inside backticks.
 				out += "`" + (el.textContent ?? "") + "`";
+				break;
+			case "img":
+				out += serializeImage(el);
 				break;
 			case "br":
 				// Two-space hard break in markdown.
@@ -269,6 +278,100 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 	}
 	if (nested.length === 0) return inline;
 	return `${inline}\n${nested.join("\n")}`;
+}
+
+/** `<img>` → `![alt](src "title")` (title optional). */
+function serializeImage(el: HtmlElementLike): string {
+	const src = el.getAttribute("src") ?? "";
+	const alt = (el.getAttribute("alt") ?? "")
+		.replace(/([\\[\]])/g, "\\$1")
+		.replace(/\n/g, " ");
+	const title = el.getAttribute("title");
+	const dest = encodeLinkDestination(src);
+	return title === null
+		? `![${alt}](${dest})`
+		: `![${alt}](${dest} "${escapeLinkTitle(title)}")`;
+}
+
+/**
+ * `<table>` → GFM pipe table. marked emits `<thead>`/`<tbody>` with an
+ * `align` attribute per cell; contenteditable tables may use
+ * `style="text-align: …"` instead — both are read. Pipes inside cell
+ * content are escaped (GFM cell boundaries split on unescaped `|`
+ * everywhere, even inside code spans).
+ */
+function serializeTable(el: HtmlElementLike): string {
+	const rows: HtmlElementLike[] = [];
+	const collectRows = (parent: HtmlElementLike): void => {
+		for (const child of arrayFrom(parent.children)) {
+			const tag = child.tagName.toLowerCase();
+			if (tag === "tr") rows.push(child);
+			else if (tag === "thead" || tag === "tbody" || tag === "tfoot") {
+				collectRows(child);
+			}
+		}
+	};
+	collectRows(el);
+	const headerRow = rows[0];
+	if (!headerRow) return el.outerHTML;
+	const headerCells = tableCells(headerRow);
+	if (headerCells.length === 0) return el.outerHTML;
+
+	const delimiter = headerCells
+		.map((cell) => {
+			const align = (
+				cell.getAttribute("align") ??
+				cell.style?.textAlign ??
+				""
+			).toLowerCase();
+			if (align === "center") return ":---:";
+			if (align === "right") return "---:";
+			if (align === "left") return ":---";
+			return "---";
+		})
+		.join(" | ");
+
+	const lines: string[] = [];
+	lines.push(tableRowLine(headerCells));
+	lines.push(`| ${delimiter} |`);
+	for (const row of rows.slice(1)) {
+		lines.push(tableRowLine(tableCells(row)));
+	}
+	return lines.join("\n");
+}
+
+function tableCells(row: HtmlElementLike): HtmlElementLike[] {
+	return arrayFrom(row.children).filter((cell) => {
+		const tag = cell.tagName.toLowerCase();
+		return tag === "th" || tag === "td";
+	});
+}
+
+function tableRowLine(cells: HtmlElementLike[]): string {
+	const rendered = cells.map((cell) =>
+		serializeInline(cell)
+			.trim()
+			.replace(/[ \t]*\n[ \t]*/g, " ")
+			.replace(/\|/g, "\\|"),
+	);
+	return `| ${rendered.join(" | ")} |`;
+}
+
+/**
+ * Render a link/image destination. Destinations containing whitespace,
+ * angle brackets, parens, or backslashes use the `<…>` form (with the
+ * delimiters escaped) so they survive the trip through marked.
+ */
+function encodeLinkDestination(href: string): string {
+	if (href === "") return "<>";
+	if (/[\s<>()\\]/.test(href)) {
+		return `<${href.replace(/\n/g, " ").replace(/([<>\\])/g, "\\$1")}>`;
+	}
+	return href;
+}
+
+function escapeLinkTitle(title: string): string {
+	return title.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ");
 }
 
 function serializeBlockquote(el: HtmlElementLike): string {
