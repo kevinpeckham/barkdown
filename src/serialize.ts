@@ -21,6 +21,7 @@ import { defaultAdapter } from "./adapter.js";
 
 const ELEMENT_NODE = 1;
 const TEXT_NODE = 3;
+const COMMENT_NODE = 8;
 
 export interface ToMarkdownOptions {
 	/**
@@ -49,18 +50,41 @@ export function toMarkdown(
 /** Serialize the direct-child sequence of an element as a list of blocks. */
 function serializeBlocks(container: HtmlElementLike): string {
 	const parts: string[] = [];
+	let previousListTag: string | null = null;
 	for (const node of arrayFrom(container.childNodes)) {
 		const part = serializeBlockNode(node);
-		if (part !== "") parts.push(part);
+		if (part === "") continue;
+		const listTag =
+			node.nodeType === ELEMENT_NODE
+				? listTagOf(node as HtmlElementLike)
+				: null;
+		// Markdown can't separate adjacent same-marker lists with a blank
+		// line alone — they'd merge into one loose list on reparse. An HTML
+		// comment (which round-trips) keeps them apart.
+		if (listTag !== null && listTag === previousListTag) {
+			parts.push("<!-- -->");
+		}
+		previousListTag = listTag;
+		parts.push(part);
 	}
 	return parts.join("\n\n");
+}
+
+function listTagOf(el: HtmlElementLike): string | null {
+	const tag = el.tagName.toLowerCase();
+	return tag === "ul" || tag === "ol" ? tag : null;
 }
 
 function serializeBlockNode(node: DomNodeLike): string {
 	if (node.nodeType === TEXT_NODE) {
 		const raw = node.textContent ?? "";
 		const trimmed = raw.trim();
-		return trimmed ? escapeMarkdownText(trimmed) : "";
+		return trimmed ? normalizeBlockLines(escapeMarkdownText(trimmed)) : "";
+	}
+	// Comments round-trip (markdown passes HTML comments through); losing
+	// them would also silently merge adjacent lists (see serializeBlocks).
+	if (node.nodeType === COMMENT_NODE) {
+		return `<!--${node.textContent ?? ""}-->`;
 	}
 	if (node.nodeType !== ELEMENT_NODE) return "";
 
@@ -74,19 +98,19 @@ function serializeBlockNode(node: DomNodeLike): string {
 		// Stripping the markers here is the round-trip safety net so a
 		// heading never emits `**`/`*`/`~~` into the markdown.
 		case "h1":
-			return "# " + serializeInline(el, true).trim();
+			return serializeHeading(el, 1);
 		case "h2":
-			return "## " + serializeInline(el, true).trim();
+			return serializeHeading(el, 2);
 		case "h3":
-			return "### " + serializeInline(el, true).trim();
+			return serializeHeading(el, 3);
 		case "h4":
-			return "#### " + serializeInline(el, true).trim();
+			return serializeHeading(el, 4);
 		case "h5":
-			return "##### " + serializeInline(el, true).trim();
+			return serializeHeading(el, 5);
 		case "h6":
-			return "###### " + serializeInline(el, true).trim();
+			return serializeHeading(el, 6);
 		case "p":
-			return serializeInline(el).trim();
+			return normalizeBlockLines(serializeInline(el).trim());
 		case "ul":
 			return serializeList(el, false);
 		case "ol":
@@ -116,6 +140,71 @@ function serializeBlockNode(node: DomNodeLike): string {
 	}
 }
 
+/**
+ * ATX headings are single-line: internal line breaks collapse to spaces,
+ * and a trailing `#` run gets escaped so it can't read as a closing
+ * sequence.
+ */
+function serializeHeading(el: HtmlElementLike, level: number): string {
+	let content = serializeInline(el, true).trim();
+	content = content.replace(/[ \t]*\n[ \t]*/g, " ");
+	content = content.replace(/(^|[ \t])(#+)$/, "$1\\$2");
+	return `${"#".repeat(level)} ${content}`;
+}
+
+/**
+ * Canonicalize the lines of a paragraph-like block:
+ * - leading whitespace is stripped (markdown can't represent it — the
+ *   parser strips continuation-line indent, so keeping it would defeat
+ *   idempotence);
+ * - trailing whitespace is stripped, except a two-plus-space hard break
+ *   before another line, which normalizes to exactly two spaces;
+ * - characters that would start a different block construct at a line
+ *   start are escaped.
+ */
+function normalizeBlockLines(text: string): string {
+	const lines = text.split("\n");
+	const out: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		let line = (lines[i] ?? "").replace(/^[ \t]+/, "");
+		const isLast = i === lines.length - 1;
+		const trailingSpaces = line.match(/ +$/)?.[0] ?? "";
+		line = line.replace(/[ \t]+$/, "");
+		line = escapeLineStart(line);
+		if (!isLast && trailingSpaces.length >= 2 && line !== "") line += "  ";
+		out.push(line);
+	}
+	return out.join("\n");
+}
+
+/**
+ * Escape text that would parse as a block construct at a line start.
+ * Characters that are special *everywhere* (`*`, `_`, `` ` ``, `~`, `[`)
+ * are already escaped by `escapeMarkdownText`; this handles the
+ * line-start-only markers the escaper deliberately leaves alone.
+ */
+function escapeLineStart(line: string): string {
+	if (line === "") return line;
+	// ATX heading: 1–6 hashes then space or end.
+	if (/^#{1,6}(\s|$)/.test(line)) return `\\${line}`;
+	// Blockquote: any leading `>` (space optional).
+	if (line.startsWith(">")) return `\\${line}`;
+	// Table row / delimiter starting with a pipe.
+	if (line.startsWith("|")) return `\\${line}`;
+	// Bullet list marker (`*` is already escaped in text).
+	if (/^[-+](\s|$)/.test(line)) return `\\${line}`;
+	// Ordered list marker.
+	const ordered = line.match(/^(\d{1,9})[.)](\s|$)/);
+	if (ordered) {
+		const digits = ordered[1] ?? "";
+		return `${digits}\\${line.slice(digits.length)}`;
+	}
+	// Setext underline / thematic break / table delimiter row: a line of
+	// nothing but -, =, :, | and spaces.
+	if (/^[-=:|\s]+$/.test(line) && /[-=:|]/.test(line)) return `\\${line}`;
+	return line;
+}
+
 /** Serialize inline content (children of a block) as markdown. */
 function serializeInline(
 	container: HtmlElementLike,
@@ -138,6 +227,10 @@ function serializeInline(
 				text = stripped;
 			}
 			out += escapeMarkdownText(text);
+			continue;
+		}
+		if (node.nodeType === COMMENT_NODE) {
+			out += `<!--${node.textContent ?? ""}-->`;
 			continue;
 		}
 		if (node.nodeType !== ELEMENT_NODE) continue;
@@ -183,20 +276,20 @@ function serializeInlineElement(
 			// `**` markers so bold text inside a heading flattens.
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: "**" + serializeInline(el) + "**";
+				: wrapDelimited(serializeInline(el), "**");
 			break;
 		case "em":
 		case "i":
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: "*" + serializeInline(el) + "*";
+				: wrapDelimited(serializeInline(el), "*");
 			break;
 		case "s":
 		case "strike":
 		case "del":
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: "~~" + serializeInline(el) + "~~";
+				: wrapDelimited(serializeInline(el), "~~");
 			break;
 		case "a": {
 			const href = el.getAttribute("href") ?? "";
@@ -229,7 +322,7 @@ function serializeInlineElement(
 		}
 		case "code":
 			// Inline code — no escaping inside backticks.
-			out += "`" + (el.textContent ?? "") + "`";
+			out += serializeCodeSpan(el.textContent ?? "");
 			break;
 		case "img":
 			out += serializeImage(el);
@@ -254,12 +347,15 @@ function serializeInlineElement(
 			}
 			const anchor = el.querySelector("a[data-footnote-ref]");
 			if (anchor) {
-				const idMatch = anchor.id.match(/footnote-ref-([A-Za-z0-9_-]+)$/);
+				// The href points at the definition and is the authoritative
+				// label; the anchor id gets a `-2` suffix on repeated refs to
+				// the same footnote, so it's only a fallback.
 				const hrefMatch = (anchor.getAttribute("href") ?? "").match(
 					/#footnote-([A-Za-z0-9_-]+)$/,
 				);
+				const idMatch = anchor.id.match(/footnote-ref-([A-Za-z0-9_-]+)$/);
 				const label =
-					idMatch?.[1] ?? hrefMatch?.[1] ?? anchor.textContent?.trim();
+					hrefMatch?.[1] ?? idMatch?.[1] ?? anchor.textContent?.trim();
 				if (label && /^[A-Za-z0-9_-]+$/.test(label)) {
 					out = escapeTrailingBang(out);
 					out += `[^${label}]`;
@@ -287,9 +383,9 @@ function serializeInlineElement(
 				const isItalic = (style?.fontStyle ?? "") === "italic";
 				const deco = `${style?.textDecoration ?? ""} ${style?.textDecorationLine ?? ""}`;
 				const isStrike = deco.includes("line-through");
-				if (isStrike) inner = `~~${inner}~~`;
-				if (isItalic) inner = `*${inner}*`;
-				if (isBold) inner = `**${inner}**`;
+				if (isStrike) inner = wrapDelimited(inner, "~~");
+				if (isItalic) inner = wrapDelimited(inner, "*");
+				if (isBold) inner = wrapDelimited(inner, "**");
 			}
 			out += inner;
 			break;
@@ -349,7 +445,9 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 
 	const flushInline = (): void => {
 		if (inline === "") return;
-		const kept = inline
+		// Blank lines are dropped — a blank line inside an item would split
+		// it into a loose item, which reparses differently.
+		const kept = normalizeBlockLines(inline)
 			.split("\n")
 			.filter((line, idx) => idx === 0 || line.trim() !== "");
 		const joined = kept.join("\n");
@@ -366,6 +464,10 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 				text = stripped;
 			}
 			inline += escapeMarkdownText(text);
+			continue;
+		}
+		if (node.nodeType === COMMENT_NODE) {
+			inline += `<!--${node.textContent ?? ""}-->`;
 			continue;
 		}
 		if (node.nodeType !== ELEMENT_NODE) continue;
@@ -494,6 +596,44 @@ function tableRowLine(cells: HtmlElementLike[]): string {
 			.replace(/\|/g, "\\|"),
 	);
 	return `| ${rendered.join(" | ")} |`;
+}
+
+/**
+ * Wrap inline content in an emphasis delimiter. CommonMark delimiters
+ * can't face whitespace, so leading/trailing whitespace is hoisted
+ * outside the markers; empty or whitespace-only content gets no markers
+ * at all (`****` would reparse as literal asterisks).
+ */
+function wrapDelimited(inner: string, marker: string): string {
+	const match = inner.match(/^(\s*)([\s\S]*?)(\s*)$/);
+	if (!match) return inner;
+	const lead = match[1] ?? "";
+	const core = match[2] ?? "";
+	const trail = match[3] ?? "";
+	if (core === "") return inner;
+	return lead + marker + core + marker + trail;
+}
+
+/**
+ * Render a code span. The delimiter must be a longer backtick run than
+ * any inside the content; content that starts/ends with a backtick (or
+ * with spaces on both ends) is padded per CommonMark's stripping rule.
+ * Newlines become spaces — the parser does that anyway.
+ */
+function serializeCodeSpan(text: string): string {
+	const content = text.replace(/\n/g, " ");
+	if (content === "") return "";
+	let maxRun = 0;
+	for (const match of content.matchAll(/`+/g)) {
+		if (match[0].length > maxRun) maxRun = match[0].length;
+	}
+	const fence = "`".repeat(maxRun + 1);
+	const needsPad =
+		content.startsWith("`") ||
+		content.endsWith("`") ||
+		(content.startsWith(" ") && content.endsWith(" ") && content.trim() !== "");
+	const pad = needsPad ? " " : "";
+	return fence + pad + content + pad + fence;
 }
 
 /**
@@ -654,18 +794,30 @@ function serializeFootnotes(el: HtmlElementLike): string {
 /**
  * Escape the minimum set of markdown special characters. We
  * intentionally under-escape rather than over-escape:
- *  - `\` — must be first so it doesn't double-escape our own escapes.
+ *  - `\` — in the class, and handled first, so it doesn't double-escape
+ *    our own escapes.
  *  - `*` and `_` — emphasis markers.
+ *  - `~` — GFM strikethrough (a single tilde pair delimits too).
  *  - `[` and `]` — link markers.
  *  - `` ` `` — code marker.
+ *  - `<` — only when it could open a tag, autolink, or comment
+ *    (followed by a letter, `/`, `!`, or `?`).
+ *  - `&` — only when it reads as a character entity (`&copy;`, `&#38;`),
+ *    which the DOM would decode on the next trip.
  *
- * We do NOT escape `#`, `-`, `+`, `>` because those are line-start
- * markers and paragraph text rarely starts with them raw. Escaping them
- * everywhere would produce ugly output like `\-` in the middle of
- * hyphenated words.
+ * We do NOT escape `#`, `-`, `+`, `>`, `|`, digits because those only
+ * matter at a line start — `escapeLineStart` handles that positionally.
+ * Escaping them everywhere would produce ugly output like `\-` in the
+ * middle of hyphenated words.
  */
 function escapeMarkdownText(text: string): string {
-	return text.replace(/([\\`*_[\]])/g, "\\$1");
+	return text
+		.replace(/([\\`*_[\]~])/g, "\\$1")
+		.replace(/<(?=[a-zA-Z/!?])/g, "\\<")
+		.replace(
+			/&(?=[a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#[xX][0-9a-fA-F]{1,6};)/g,
+			"\\&",
+		);
 }
 
 /** Array.from over the minimal ArrayLike the adapter types expose. */
