@@ -1,7 +1,7 @@
 {
 	"name": "@kevinpeckham/barkdown",
-	"version": "0.1.0",
-	"description": "Markdown ⇄ DOM round-trip codec, guaranteed to invert marked. Canonical identity, fixed-point convergence, footnote fidelity, and no silent loss — the serializer half of an editable-markdown pipeline.",
+	"version": "0.1.1",
+	"description": "Markdown \u21c4 DOM round-trip codec, guaranteed to invert marked. Canonical identity, fixed-point convergence, footnote fidelity, and no silent loss \u2014 the serializer half of an editable-markdown pipeline.",
 	"author": "Kevin Peckham",
 	"license": "MIT",
 	"type": "module",
