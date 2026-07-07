@@ -121,7 +121,12 @@ What `roundTrip` normalizes any markdown into:
 - **Links**: `[text](dest "title")`; destinations are pre-normalized
   with marked's own `cleanUrl` (encodeURI) transform so they're
   byte-stable. Self-links (`text === href`, incl. `mailto:`) emit as
-  bare GFM autolinks when the surrounding context re-linkifies safely.
+  bare GFM autolinks when the surrounding context re-linkifies safely
+  *and* the URL is already in cleanUrl's canonical percent-encoded form.
+  URLs carrying raw unicode or DOM-decoded entities (`…/café`,
+  `…#&#169;`) canonicalize to the full form — readable text, encoded
+  destination — because re-linkifying them bare would percent-encode
+  the href out from under the text.
 - **Images**: `![alt](src "title")`.
 - **Footnotes**: `[^label]` + `[^label]: text`, multi-paragraph
   definitions via 4-space continuation. Definitions never referenced

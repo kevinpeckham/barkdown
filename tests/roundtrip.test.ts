@@ -30,6 +30,13 @@ const CANONICAL: Record<string, string> = {
 	link: "See [the docs](https://example.com/docs) here.\n",
 	"link with title": '[home](/x "Hint text")\n',
 	"bare autolink": "visit https://example.com/path now\n",
+	// Percent-already-encoded URLs are cleanUrl fixed points: bare is
+	// canonical for them, while raw-unicode URLs take the full form (see
+	// the regression fixtures in CONVERGENT).
+	"bare autolink with percent-encoding":
+		"visit https://example.com/a%20b now\n",
+	"encoded-destination self link":
+		"[https\\://example.com#©word](https://example.com#%C2%A9word)\n",
 	"email autolink": "mail kevin@example.com today\n",
 	image: "![alt text](/img.png)\n",
 	"image with title": '![alt](/img.png "A title")\n',
@@ -131,6 +138,16 @@ const CONVERGENT: Record<string, string> = {
 	"bare angle bracket": "5 < 6 fine\n",
 	"unreferenced footnote def": "[^1]: orphan note\n",
 	"self-referential footnote": "[^a]: note[^a]\n",
+	// Regression (prepublish property-suite find): URLs whose visible text
+	// is NOT a fixed point of marked's cleanUrl transform must not emit as
+	// bare autolinks — the re-linkified href percent-encodes and stops
+	// matching the text. Entity in fragment (the original counterexample),
+	// unicode in path/query, and the angle-autolink shape all canonicalize
+	// to the full [text](encoded-dest) form in one trip.
+	"entity in bare url fragment": "https://example.com#&#169;word\n",
+	"unicode in bare url path": "visit https://example.com/café now\n",
+	"unicode in bare url query": "visit https://example.com?q=© now\n",
+	"unicode angle autolink": "<https://example.com/café>\n",
 };
 
 describe("round-trip — canonical identity (guarantee 1)", () => {

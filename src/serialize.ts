@@ -1094,8 +1094,28 @@ function isBareAutolinkable(
 	if (href !== text) return false;
 	if (!/^https?:\/\/[^\s<>()]+$/.test(text)) return false;
 	if (!/[A-Za-z0-9/]$/.test(text)) return false;
+	// The text must be a fixed point of marked's cleanUrl transform:
+	// re-linkifying the bare text sets href = cleanUrl(text), so any
+	// character that percent-encodes (unicode, or a DOM-decoded entity
+	// that made text === href this trip) would break the self-link
+	// equality on the next trip. Such URLs canonicalize to the full
+	// [text](encoded-dest) form instead.
+	if (markedCleanUrl(text) !== text) return false;
 	const domain = text.match(/^https?:\/\/([^/?#:]+)/)?.[1] ?? "";
 	return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(domain);
+}
+
+/**
+ * marked's `cleanUrl` normalization, verbatim: every link/image
+ * destination it parses goes through this before landing in `href`.
+ */
+function markedCleanUrl(href: string): string {
+	try {
+		return encodeURI(href).replace(/%25/g, "%");
+	} catch {
+		// lone surrogates etc — marked would drop the link; keep raw.
+		return href;
+	}
 }
 
 /**
@@ -1160,12 +1180,7 @@ function escapeTrailingBang(out: string): string {
  * still contains parens/whitespace after encoding uses the `<…>` form.
  */
 function encodeLinkDestination(href: string): string {
-	let encoded = href;
-	try {
-		encoded = encodeURI(href).replace(/%25/g, "%");
-	} catch {
-		// lone surrogates etc — marked would drop the link; keep raw.
-	}
+	const encoded = markedCleanUrl(href);
 	if (encoded === "") return "<>";
 	if (/[\s<>()\\]/.test(encoded)) {
 		return `<${encoded.replace(/\n/g, " ").replace(/([<>\\])/g, "\\$1")}>`;
