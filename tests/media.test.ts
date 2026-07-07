@@ -47,9 +47,15 @@ describe("toMarkdown — images", () => {
 		);
 	});
 
-	test("src with spaces uses angle-bracket destination", () => {
+	test("src with spaces percent-encodes like marked's cleanUrl", () => {
 		expect(toMarkdown(frag('<p><img src="/a b.png" alt="x"></p>'))).toBe(
-			"![x](</a b.png>)\n",
+			"![x](/a%20b.png)\n",
+		);
+	});
+
+	test("src with parens uses angle-bracket destination", () => {
+		expect(toMarkdown(frag('<p><img src="/a(b).png" alt="x"></p>'))).toBe(
+			"![x](</a(b).png>)\n",
 		);
 	});
 

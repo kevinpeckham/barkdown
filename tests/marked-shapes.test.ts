@@ -95,19 +95,23 @@ describe("toMarkdown — footnote labels", () => {
 
 	test("non-numeric label round-trips in the section", () => {
 		const html =
+			'<p>Ref<sup><a id="footnote-ref-note" href="#footnote-note" data-footnote-ref>1</a></sup></p>' +
 			'<section class="footnotes" data-footnotes><ol>' +
 			'<li id="footnote-note"><p>Labeled <em>note</em> <a href="#footnote-ref-note" data-footnote-backref>↩</a></p></li>' +
 			"</ol></section>";
-		expect(toMarkdown(frag(html))).toBe("[^note]: Labeled *note*\n");
+		expect(toMarkdown(frag(html))).toBe(
+			"Ref[^note]\n\n[^note]: Labeled *note*\n",
+		);
 	});
 
 	test("multi-paragraph definition uses indented continuation", () => {
 		const html =
+			'<p>Ref<sup><a id="footnote-ref-1" href="#footnote-1" data-footnote-ref>1</a></sup></p>' +
 			'<section class="footnotes" data-footnotes><ol>' +
 			'<li id="footnote-1"><p>First para.</p><p>Second para. <a href="#footnote-ref-1" data-footnote-backref>↩</a></p></li>' +
 			"</ol></section>";
 		expect(toMarkdown(frag(html))).toBe(
-			"[^1]: First para.\n\n    Second para.\n",
+			"Ref[^1]\n\n[^1]: First para.\n\n    Second para.\n",
 		);
 	});
 });
@@ -127,12 +131,16 @@ describe("toMarkdown — bare autolinks", () => {
 		).toBe("mail a@b.com now\n");
 	});
 
+	// In full-form links the *text* half gets the standard text escaping,
+	// including the defused scheme colon (`https\://`) that keeps bare
+	// URLs in text nodes from linkifying. It resolves back to the same
+	// characters on every trip.
 	test("self-link with unsafe following text uses full form", () => {
 		expect(
 			toMarkdown(
 				frag('<p>see <a href="https://x.com">https://x.com</a>, ok</p>'),
 			),
-		).toBe("see [https://x.com](https://x.com), ok\n");
+		).toBe("see [https\\://x.com](https://x.com), ok\n");
 	});
 
 	test("self-link ending in trim-set punctuation uses full form", () => {
@@ -140,7 +148,7 @@ describe("toMarkdown — bare autolinks", () => {
 			toMarkdown(
 				frag('<p>see <a href="https://x.com/a.">https://x.com/a.</a> ok</p>'),
 			),
-		).toBe("see [https://x.com/a.](https://x.com/a.) ok\n");
+		).toBe("see [https\\://x.com/a.](https://x.com/a.) ok\n");
 	});
 
 	test("underscore domain uses full form (GFM would not linkify)", () => {
@@ -148,7 +156,16 @@ describe("toMarkdown — bare autolinks", () => {
 			toMarkdown(
 				frag('<p>see <a href="https://a_b.com/x">https://a_b.com/x</a> ok</p>'),
 			),
-		).toBe("see [https://a\\_b.com/x](https://a_b.com/x) ok\n");
+		).toBe("see [https\\://a\\_b.com/x](https://a_b.com/x) ok\n");
+	});
+
+	test("bare URL in a text node is defused, not linkified next trip", () => {
+		expect(toMarkdown(frag("<p>go to https://x.com now</p>"))).toBe(
+			"go to https\\://x.com now\n",
+		);
+		expect(toMarkdown(frag("<p>mail kevin@example.com now</p>"))).toBe(
+			"mail kevin\\@example.com now\n",
+		);
 	});
 });
 

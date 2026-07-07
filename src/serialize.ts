@@ -43,8 +43,79 @@ export function toMarkdown(
 		container = input;
 	}
 
-	const body = serializeBlocks(container).trimEnd();
+	const body = dropUnreferencedFootnoteDefs(
+		serializeBlocks(container),
+	).trimEnd();
 	return body.length ? body + "\n" : "";
+}
+
+/**
+ * marked-footnote renders nothing for a definition that is never
+ * referenced outside the footnote section itself, so emitting such a
+ * definition would vanish one trip late. Canonicalize by dropping it now.
+ */
+function dropUnreferencedFootnoteDefs(markdown: string): string {
+	const defLine = /^\[\^([A-Za-z0-9_-]+)\]:/;
+	const fenceLine = /^ {0,3}(?:`{3,}|~{3,})/;
+	let current = markdown;
+	// Dropping a definition can orphan another (its content held the only
+	// ref) — iterate to a fixpoint. Bounded by the number of definitions.
+	for (let pass = 0; pass < 50; pass++) {
+		if (!/^\[\^[A-Za-z0-9_-]+\]:/m.test(current)) return current;
+		const lines = current.split("\n");
+		// Fenced-code regions are opaque: def-looking lines inside them are
+		// not definitions and ref-looking text is not a reference.
+		const inCode: boolean[] = [];
+		let codeOpen = false;
+		for (const line of lines) {
+			if (fenceLine.test(line)) {
+				inCode.push(true); // the fence line itself is code context
+				codeOpen = !codeOpen;
+			} else {
+				inCode.push(codeOpen);
+			}
+		}
+		const isReferenced = (label: string): boolean => {
+			// A "reference" is any unescaped [^label] occurrence (outside
+			// code) that is not itself the prefix of a definition line —
+			// marked-footnote counts refs inside definition content
+			// (including self-refs).
+			const needle = new RegExp(`(?<!\\\\)\\[\\^${label}\\](:?)`, "g");
+			for (let i = 0; i < lines.length; i++) {
+				if (inCode[i]) continue;
+				const line = lines[i] ?? "";
+				for (const m of line.matchAll(needle)) {
+					if (!(m[1] === ":" && m.index === 0 && defLine.test(line))) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
+		const kept: string[] = [];
+		let dropped = false;
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i] ?? "";
+			const match = inCode[i] ? null : line.match(defLine);
+			if (match && !isReferenced(match[1] ?? "")) {
+				dropped = true;
+				// Skip the definition plus its continuation lines, and one
+				// following blank line so no double blank is left behind.
+				while (i + 1 < lines.length) {
+					const next = lines[i + 1] ?? "";
+					if (/^ {4}/.test(next)) i++;
+					else if (next.trim() === "" && /^ {4}/.test(lines[i + 2] ?? "x")) i++;
+					else break;
+				}
+				if ((lines[i + 1] ?? "x").trim() === "") i++;
+				continue;
+			}
+			kept.push(line);
+		}
+		current = kept.join("\n");
+		if (!dropped) return current;
+	}
+	return current;
 }
 
 /** Serialize the direct-child sequence of an element as a list of blocks. */
@@ -110,7 +181,9 @@ function serializeBlockNode(node: DomNodeLike): string {
 		case "h6":
 			return serializeHeading(el, 6);
 		case "p":
-			return normalizeBlockLines(serializeInline(el).trim());
+			return liftLineStartComments(
+				normalizeBlockLines(serializeInline(el).trim()),
+			);
 		case "ul":
 			return serializeList(el, false);
 		case "ol":
@@ -136,9 +209,143 @@ function serializeBlockNode(node: DomNodeLike): string {
 			// children as if it were transparent.
 			return serializeBlocks(el);
 		default:
-			return el.outerHTML;
+			// Tags on CommonMark's HTML-block list pass through raw and
+			// unparsed, so outerHTML is byte-stable for them. Anything else
+			// reparses in *paragraph* context (its text is markdown-parsed),
+			// so serialize it as a paragraph of inline content — block
+			// children inside it (invalid-HTML artifacts) split out.
+			if (HTML_BLOCK_TAGS.has(tag)) return el.outerHTML;
+			return serializeStrayBlockElement(el);
 	}
 }
+
+/** Block-level tags that must split out of a stray inline wrapper. */
+const SPLITTING_BLOCK_TAGS = new Set([
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"blockquote",
+	"pre",
+	"table",
+	"hr",
+	"ul",
+	"ol",
+]);
+
+/**
+ * A non-HTML-block element at block position (e.g. `<b>` from an HTML
+ * block, custom elements). It reparses in paragraph context, so it
+ * serializes as raw tags around escaped inline content — but block
+ * children (a `<pre>` swallowed into a `<b>` by tree construction) must
+ * become their own blocks, mirroring how the reparse splits them.
+ */
+function serializeStrayBlockElement(el: HtmlElementLike): string {
+	const kids = arrayFrom(el.childNodes).filter((n) => !isVanishingNode(n));
+	const hasBlockChild = kids.some(
+		(n) =>
+			n.nodeType === ELEMENT_NODE &&
+			SPLITTING_BLOCK_TAGS.has((n as HtmlElementLike).tagName.toLowerCase()),
+	);
+	if (!hasBlockChild) {
+		return normalizeBlockLines(
+			serializeInlineElement("", el, false, undefined).trim(),
+		);
+	}
+	const parts: string[] = [];
+	let inline = "";
+	const flushInline = (): void => {
+		const clamped = clampTagInner(inline).trim();
+		if (clamped !== "") {
+			parts.push(normalizeBlockLines(rawInlineTag(el, clamped).trim()));
+		}
+		inline = "";
+	};
+	for (let i = 0; i < kids.length; i++) {
+		const kid = kids[i] as DomNodeLike;
+		if (kid.nodeType === TEXT_NODE) {
+			inline += escapeMarkdownText(kid.textContent ?? "");
+			continue;
+		}
+		if (kid.nodeType === COMMENT_NODE) {
+			flushInline();
+			parts.push(`<!--${kid.textContent ?? ""}-->`);
+			continue;
+		}
+		if (kid.nodeType !== ELEMENT_NODE) continue;
+		const childEl = kid as HtmlElementLike;
+		if (SPLITTING_BLOCK_TAGS.has(childEl.tagName.toLowerCase())) {
+			flushInline();
+			parts.push(serializeBlockNode(childEl));
+		} else {
+			inline = serializeInlineElement(inline, childEl, false, kids[i + 1]);
+		}
+	}
+	flushInline();
+	return parts.filter((p) => p !== "").join("\n\n");
+}
+
+/**
+ * CommonMark HTML-block (type 1/6) tag names barkdown doesn't already
+ * handle: for these, marked passes content through without markdown
+ * parsing, so raw outerHTML round-trips byte-for-byte.
+ */
+const HTML_BLOCK_TAGS = new Set([
+	"address",
+	"article",
+	"aside",
+	"base",
+	"basefont",
+	"body",
+	"caption",
+	"center",
+	"col",
+	"colgroup",
+	"dd",
+	"details",
+	"dialog",
+	"dir",
+	"dl",
+	"dt",
+	"fieldset",
+	"figcaption",
+	"figure",
+	"footer",
+	"form",
+	"frame",
+	"frameset",
+	"head",
+	"header",
+	"html",
+	"iframe",
+	"legend",
+	"li",
+	"link",
+	"main",
+	"menu",
+	"menuitem",
+	"meta",
+	"nav",
+	"noframes",
+	"optgroup",
+	"option",
+	"param",
+	"script",
+	"search",
+	"style",
+	"summary",
+	"tbody",
+	"td",
+	"textarea",
+	"tfoot",
+	"th",
+	"thead",
+	"title",
+	"tr",
+	"track",
+]);
 
 /**
  * ATX headings are single-line: internal line breaks collapse to spaces,
@@ -171,10 +378,53 @@ function normalizeBlockLines(text: string): string {
 		const trailingSpaces = line.match(/ +$/)?.[0] ?? "";
 		line = line.replace(/[ \t]+$/, "");
 		line = escapeLineStart(line);
-		if (!isLast && trailingSpaces.length >= 2 && line !== "") line += "  ";
+		// A hard break survives only before a non-blank line (a blank line
+		// ends the paragraph, where trailing spaces are stripped).
+		const nextIsContent = (lines[i + 1] ?? "").trim() !== "";
+		if (!isLast && nextIsContent && trailingSpaces.length >= 2 && line !== "")
+			line += "  ";
 		out.push(line);
 	}
 	return out.join("\n");
+}
+
+/**
+ * A paragraph line that *starts* with an HTML comment reparses as a raw
+ * HTML block that swallows the rest of the line unparsed — escapes after
+ * it would double every trip. Lift such comments into their own blocks
+ * (which is exactly the shape reparsing produces).
+ */
+function liftLineStartComments(text: string): string {
+	if (!text.includes("<!--")) return text;
+	const blocks: string[] = [];
+	let current: string[] = [];
+	const flush = (): void => {
+		if (current.length > 0) {
+			// The block's final line can't keep a hard-break marker — the
+			// parser strips trailing spaces at a paragraph end.
+			const lastIndex = current.length - 1;
+			current[lastIndex] = (current[lastIndex] ?? "").replace(/ +$/, "");
+			blocks.push(current.join("\n"));
+			current = [];
+		}
+	};
+	for (const originalLine of text.split("\n")) {
+		let line = originalLine;
+		let m = line.match(/^(<!--[\s\S]*?-->)[ \t]*(.*)$/);
+		while (m) {
+			flush();
+			blocks.push(m[1] ?? "");
+			// The remainder now sits at a fresh line start — re-apply the
+			// line-start escapes.
+			line = escapeLineStart(m[2] ?? "");
+			m = line.match(/^(<!--[\s\S]*?-->)[ \t]*(.*)$/);
+		}
+		// Keep pre-existing blank lines; drop a line that became empty
+		// because it was only comments.
+		if (line !== "" || line === originalLine) current.push(line);
+	}
+	flush();
+	return blocks.join("\n\n");
 }
 
 /**
@@ -205,18 +455,32 @@ function escapeLineStart(line: string): string {
 	return line;
 }
 
-/** Serialize inline content (children of a block) as markdown. */
+/**
+ * Serialize inline content (children of a block) as markdown.
+ * `nextAfterContainer` is what follows the container itself — forwarded
+ * to the last child so boundary decisions (bare autolinks, flanking) see
+ * through transparent wrappers.
+ */
 function serializeInline(
 	container: HtmlElementLike,
 	stripEmphasis = false,
 	allowLeadingCheckbox = false,
+	nextAfterContainer?: DomNodeLike,
+	precedingText = "",
 ): string {
-	let out = "";
+	// Seeded with what precedes the container so first-child boundary
+	// decisions (delimiter adjacency, flanking) see through transparent
+	// wrappers; the seed is sliced back off before returning.
+	let out = precedingText;
 	// Set after a task-list checkbox is emitted: the marker carries its own
 	// trailing space, so the single space marked renders after the input is
 	// swallowed rather than doubled.
 	let trimLeading = false;
-	const nodes = arrayFrom(container.childNodes);
+	// Wrappers that emit nothing are dropped up front so they can't skew
+	// next-sibling boundary decisions (they won't exist next trip).
+	const nodes = arrayFrom(container.childNodes).filter(
+		(n) => !isVanishingNode(n),
+	);
 	for (let i = 0; i < nodes.length; i++) {
 		const node = nodes[i] as DomNodeLike;
 		if (node.nodeType === TEXT_NODE) {
@@ -239,15 +503,40 @@ function serializeInline(
 
 		// GFM task-list checkbox (loose items: marked nests it in the
 		// item's first <p>).
-		if (allowLeadingCheckbox && out === "" && isCheckboxInput(el)) {
+		if (allowLeadingCheckbox && out === precedingText && isCheckboxInput(el)) {
 			out += el.hasAttribute("checked") ? "[x] " : "[ ] ";
 			trimLeading = true;
 			continue;
 		}
 		trimLeading = false;
-		out = serializeInlineElement(out, el, stripEmphasis, nodes[i + 1]);
+		out = serializeInlineElement(
+			out,
+			el,
+			stripEmphasis,
+			nodes[i + 1] ?? nextAfterContainer,
+		);
 	}
-	return out;
+	return out.slice(precedingText.length);
+}
+
+/**
+ * True for transparent wrapper elements that serialize to exactly ""
+ * (recursively empty div/p/span). They vanish on the next trip, so
+ * boundary decisions (e.g. bare autolinks) must not see them.
+ */
+function isVanishingNode(node: DomNodeLike): boolean {
+	if (node.nodeType !== ELEMENT_NODE) return false;
+	const el = node as HtmlElementLike;
+	const tag = el.tagName.toLowerCase();
+	if (tag !== "div" && tag !== "p" && tag !== "span") return false;
+	if (tag === "span") {
+		const style = el.getAttribute("style") ?? "";
+		if (/font-weight|font-style|text-decoration/i.test(style)) return false;
+	}
+	for (const child of arrayFrom(el.childNodes)) {
+		if (!isVanishingNode(child)) return false;
+	}
+	return true;
 }
 
 function isCheckboxInput(el: HtmlElementLike): boolean {
@@ -276,20 +565,28 @@ function serializeInlineElement(
 			// `**` markers so bold text inside a heading flattens.
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: wrapDelimited(serializeInline(el), "**");
+				: wrapOrRawTag(el, serializeInline(el), "**", out, next);
 			break;
 		case "em":
 		case "i":
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: wrapDelimited(serializeInline(el), "*");
+				: wrapOrRawTag(el, serializeInline(el), "*", out, next);
 			break;
 		case "s":
 		case "strike":
 		case "del":
 			out += stripEmphasis
 				? serializeInline(el, true)
-				: wrapDelimited(serializeInline(el), "~~");
+				: wrapOrRawTag(el, serializeInline(el), "~~", out, next);
+			break;
+		case "div":
+		case "p":
+			// Wrappers in an inline position (contenteditable artifacts,
+			// paragraphs inside odd containers): transparent, unwrapping
+			// every level in a single pass. The wrapper's own next sibling
+			// and preceding output are forwarded for boundary decisions.
+			out += serializeInline(el, stripEmphasis, false, next, out);
 			break;
 		case "a": {
 			const href = el.getAttribute("href") ?? "";
@@ -305,11 +602,17 @@ function serializeInlineElement(
 			// Only safe when both source boundaries stay delimiters.
 			if (
 				title === null &&
-				isBareAutolinkable(href, el.textContent ?? "") &&
-				autolinkBoundaryBefore(out) &&
+				isBareAutolinkable(href, el.textContent ?? "", out) &&
 				autolinkBoundaryAfter(next)
 			) {
 				out += el.textContent ?? "";
+				break;
+			}
+			// marked quirk: inside link text an escaped `\[…\]` pair followed
+			// by `(` re-parses as a nested link/image despite the escapes.
+			// A raw anchor round-trips stably.
+			if (LINK_TEXT_QUIRK.test(inner)) {
+				out += rawAnchorTag(el, inner);
 				break;
 			}
 			out = escapeTrailingBang(out);
@@ -362,7 +665,7 @@ function serializeInlineElement(
 					break;
 				}
 			}
-			out += el.outerHTML;
+			out += unknownInlineMarkup(el);
 			break;
 		}
 		case "span": {
@@ -372,28 +675,95 @@ function serializeInlineElement(
 			// line-through) so CSS-styled spans (e.g. pasted from Word or
 			// Google Docs) still round-trip to **/*/~~ instead of silently
 			// losing the emphasis.
-			let inner = serializeInline(el, stripEmphasis);
-			if (!stripEmphasis) {
-				const style = el.style;
-				const fw = style?.fontWeight ?? "";
-				const isBold =
-					fw === "bold" ||
-					fw === "bolder" ||
-					(/^\d+$/.test(fw) && Number(fw) >= 600);
-				const isItalic = (style?.fontStyle ?? "") === "italic";
-				const deco = `${style?.textDecoration ?? ""} ${style?.textDecorationLine ?? ""}`;
-				const isStrike = deco.includes("line-through");
-				if (isStrike) inner = wrapDelimited(inner, "~~");
-				if (isItalic) inner = wrapDelimited(inner, "*");
-				if (isBold) inner = wrapDelimited(inner, "**");
+			const style = el.style;
+			const fw = style?.fontWeight ?? "";
+			const isBold =
+				fw === "bold" ||
+				fw === "bolder" ||
+				(/^\d+$/.test(fw) && Number(fw) >= 600);
+			const isItalic = (style?.fontStyle ?? "") === "italic";
+			const deco = `${style?.textDecoration ?? ""} ${style?.textDecorationLine ?? ""}`;
+			const isStrike = deco.includes("line-through");
+			const styled = !stripEmphasis && (isBold || isItalic || isStrike);
+			// Transparent spans forward the surrounding context; styled
+			// spans start fresh (their content sits inside the markers).
+			let inner = serializeInline(
+				el,
+				stripEmphasis,
+				false,
+				styled ? undefined : next,
+				styled ? "" : out,
+			);
+			if (styled) {
+				const markers: string[] = [];
+				if (isStrike) markers.push("~~");
+				if (isItalic) markers.push("*");
+				if (isBold) markers.push("**");
+				for (const marker of markers) {
+					const wrapped = tryWrapDelimited(inner, marker, out, next);
+					if (wrapped === null) {
+						// Unrepresentable (empty or ambiguous delimiter run):
+						// a raw styled span with the escaped inner content
+						// round-trips stably and keeps the styling.
+						inner = rawInlineTag(el, serializeInline(el));
+						break;
+					}
+					inner = wrapped;
+				}
 			}
 			out += inner;
 			break;
 		}
 		default:
-			out += el.outerHTML;
+			out += unknownInlineMarkup(el);
 	}
 	return out;
+}
+
+/** Void elements: no closing tag when rebuilding unknown markup. */
+const VOID_TAGS = new Set([
+	"area",
+	"base",
+	"br",
+	"col",
+	"embed",
+	"hr",
+	"img",
+	"input",
+	"link",
+	"meta",
+	"param",
+	"source",
+	"track",
+	"wbr",
+]);
+
+/**
+ * Rebuild an unknown inline element as raw tags around its markdown-
+ * escaped serialized children. `outerHTML` would be unstable here:
+ * marked parses the text between raw inline tags as markdown, so
+ * unescaped `*`/`\` text characters would change structure next trip.
+ * The rebuilt form reparses to the identical DOM.
+ */
+function unknownInlineMarkup(el: HtmlElementLike): string {
+	const names = el.getAttributeNames?.();
+	if (names === undefined) return el.outerHTML; // adapter can't enumerate
+	const tag = el.tagName.toLowerCase();
+	const attrs = names
+		.map((name) => ` ${name}="${escapeHtmlAttr(el.getAttribute(name) ?? "")}"`)
+		.join("");
+	if (VOID_TAGS.has(tag)) return `<${tag}${attrs}>`;
+	return `<${tag}${attrs}>${clampTagInner(serializeInline(el))}</${tag}>`;
+}
+
+/**
+ * Inner content of a rebuilt raw tag must not leave the open tag (or the
+ * closing tag) alone on its own line — that shape is a CommonMark type-7
+ * HTML block, which would swallow the following lines unparsed. Leading/
+ * trailing newline-bearing whitespace is normalized away.
+ */
+function clampTagInner(inner: string): string {
+	return inner.replace(/^[ \t]*\n\s*/, "").replace(/\s*\n[ \t]*$/, "");
 }
 
 /** Serialize a `<ul>` or `<ol>` (recursive for nested lists). */
@@ -411,7 +781,23 @@ function serializeList(el: HtmlElementLike, ordered: boolean): string {
 		const marker = ordered ? `${index}.` : "-";
 		const childIndent = marker.length + 1;
 		const itemBody = serializeListItem(child, childIndent);
-		lines.push(`${marker} ${itemBody}`);
+		// No trailing whitespace on the final line (empty items, trailing
+		// hard breaks): the parser strips it, so it can't round-trip.
+		let composed = `${marker} ${itemBody}`.replace(/ +$/, "");
+		// Chained empty nested lists or a leading hr can compose a line of
+		// only dashes and spaces ("- - -", "- ---"), which reparses as a
+		// thematic break — drop the item body to its own (indented) line.
+		const firstLine = (composed.split("\n", 1)[0] ?? "").trimEnd();
+		if (
+			/^[- ]+$/.test(firstLine) &&
+			(firstLine.match(/-/g) ?? []).length >= 3
+		) {
+			composed = `${marker}\n${itemBody
+				.split("\n")
+				.map((l) => " ".repeat(childIndent) + l)
+				.join("\n")}`;
+		}
+		lines.push(composed);
 		index++;
 	}
 	return lines.join("\n");
@@ -445,17 +831,26 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 
 	const flushInline = (): void => {
 		if (inline === "") return;
-		// Blank lines are dropped — a blank line inside an item would split
-		// it into a loose item, which reparses differently.
-		const kept = normalizeBlockLines(inline)
-			.split("\n")
-			.filter((line, idx) => idx === 0 || line.trim() !== "");
-		const joined = kept.join("\n");
-		if (joined.trim() !== "") parts.push(joined);
+		// Line-start comments must become their own parts (see the comment
+		// branch below); blank lines are dropped — a blank line inside an
+		// item would split it into a loose item, which reparses differently.
+		const lifted = liftLineStartComments(normalizeBlockLines(inline));
+		for (const block of lifted.split("\n\n")) {
+			const kept = block
+				.split("\n")
+				.filter((line) => line.trim() !== "")
+				.join("\n")
+				// A hard break can't end a part — the parser strips trailing
+				// spaces at the end of a paragraph.
+				.replace(/ +$/, "");
+			if (kept.trim() !== "") parts.push(kept);
+		}
 		inline = "";
 	};
 
-	for (const node of arrayFrom(li.childNodes)) {
+	const nodes = arrayFrom(li.childNodes).filter((n) => !isVanishingNode(n));
+	for (let i = 0; i < nodes.length; i++) {
+		const node = nodes[i] as DomNodeLike;
 		if (node.nodeType === TEXT_NODE) {
 			let text = node.textContent ?? "";
 			if (trimLeading) {
@@ -467,7 +862,16 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 			continue;
 		}
 		if (node.nodeType === COMMENT_NODE) {
-			inline += `<!--${node.textContent ?? ""}-->`;
+			// A comment that would *start* a line must own that line: a line
+			// starting with `<!--` is one raw HTML block to the end of the
+			// line, so any escaped text after it would go through raw and
+			// re-escape every trip. Mid-line comments are plain inline HTML.
+			if (inline === "" || inline.endsWith("\n")) {
+				flushInline();
+				parts.push(`<!--${node.textContent ?? ""}-->`);
+			} else {
+				inline += `<!--${node.textContent ?? ""}-->`;
+			}
 			continue;
 		}
 		if (node.nodeType !== ELEMENT_NODE) continue;
@@ -502,12 +906,10 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 		} else if (LIST_ITEM_BLOCK_TAGS.has(tag)) {
 			flushInline();
 			parts.push(serializeBlockNode(child));
-		} else if (tag === "div") {
-			// Contenteditable wrapper: transparent, like at block level.
-			inline += serializeInline(child);
 		} else {
-			// Inline element: same handling as inside any other block.
-			inline = serializeInlineElement(inline, child, false, undefined);
+			// Inline element: same handling as inside any other block
+			// (divs are transparent there too).
+			inline = serializeInlineElement(inline, child, false, nodes[i + 1]);
 		}
 	}
 	flushInline();
@@ -521,13 +923,35 @@ function serializeListItem(li: HtmlElementLike, childIndent: number): string {
 		.join("\n");
 }
 
+/**
+ * marked quirk detector: inside link text (and image alt), an escaped
+ * `\[…\]` pair followed by `(` re-parses as a nested construct even
+ * though the brackets are escaped. Callers fall back to raw tags.
+ */
+const LINK_TEXT_QUIRK = /\\\[[\s\S]*?\\\]\(|\\\[\^/;
+
+/** Raw-HTML anchor fallback for link text markdown can't carry. */
+function rawAnchorTag(el: HtmlElementLike, inner: string): string {
+	const href = el.getAttribute("href") ?? "";
+	const title = el.getAttribute("title");
+	const titleAttr = title === null ? "" : ` title="${escapeHtmlAttr(title)}"`;
+	return `<a href="${escapeHtmlAttr(href)}"${titleAttr}>${inner}</a>`;
+}
+
+function escapeHtmlAttr(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
 /** `<img>` → `![alt](src "title")` (title optional). */
 function serializeImage(el: HtmlElementLike): string {
 	const src = el.getAttribute("src") ?? "";
-	const alt = (el.getAttribute("alt") ?? "")
-		.replace(/([\\[\]])/g, "\\$1")
-		.replace(/\n/g, " ");
+	const rawAlt = el.getAttribute("alt") ?? "";
+	const alt = rawAlt.replace(/([\\[\]])/g, "\\$1").replace(/\n/g, " ");
 	const title = el.getAttribute("title");
+	if (LINK_TEXT_QUIRK.test(alt)) {
+		const titleAttr = title === null ? "" : ` title="${escapeHtmlAttr(title)}"`;
+		return `<img src="${escapeHtmlAttr(src)}" alt="${escapeHtmlAttr(rawAlt)}"${titleAttr}>`;
+	}
 	const dest = encodeLinkDestination(src);
 	return title === null
 		? `![${alt}](${dest})`
@@ -599,19 +1023,198 @@ function tableRowLine(cells: HtmlElementLike[]): string {
 }
 
 /**
- * Wrap inline content in an emphasis delimiter. CommonMark delimiters
- * can't face whitespace, so leading/trailing whitespace is hoisted
- * outside the markers; empty or whitespace-only content gets no markers
- * at all (`****` would reparse as literal asterisks).
+ * Wrap inline content in an emphasis delimiter, or return null when the
+ * result would not reparse as written:
+ * - CommonMark delimiters can't face whitespace, so leading/trailing
+ *   whitespace is hoisted outside the markers; empty or whitespace-only
+ *   content is unrepresentable (`****` reparses as literal asterisks).
+ * - Content whose edges already carry *unescaped* marker characters
+ *   (nested emphasis) merges into a longer delimiter run. Symmetric
+ *   runs reparse to the same bytes; asymmetric ones (`**0*!*`) do not.
+ *   Tilde runs beyond `~~` never delimit, so any edge tilde bails.
+ * (`escapeMarkdownText` escapes `*`/`~` in text, so a backslash-preceded
+ * edge char is literal text, not a delimiter — hence the lookbehind.)
  */
-function wrapDelimited(inner: string, marker: string): string {
+function tryWrapDelimited(
+	inner: string,
+	marker: string,
+	before: string,
+	next: DomNodeLike | undefined,
+): string | null {
 	const match = inner.match(/^(\s*)([\s\S]*?)(\s*)$/);
-	if (!match) return inner;
+	if (!match) return null;
 	const lead = match[1] ?? "";
 	const core = match[2] ?? "";
 	const trail = match[3] ?? "";
-	if (core === "") return inner;
+	if (core === "") return null;
+	const isTilde = marker[0] === "~";
+	const delimiterChar = isTilde ? "~" : "*";
+	// Edge delimiter runs. marked's emStrong run accounting does not
+	// honor backslash escapes adjacent to a run, so an *escaped* edge
+	// star is just as hazardous as a real one. Symmetric unescaped
+	// asterisk runs reparse to the same bytes (`***x***`); anything else
+	// bails to the raw-tag fallback. Tilde runs beyond `~~` never
+	// delimit, so any edge tilde bails.
+	const leadRun = core.match(isTilde ? /^~+/ : /^\*+/)?.[0].length ?? 0;
+	const trailRun = core.match(isTilde ? /~+$/ : /\*+$/)?.[0].length ?? 0;
+	// marked's emStrong/del run arithmetic miscounts around
+	// backslash-escaped marker characters (anywhere in the content, not
+	// just at the edges), so any escaped marker char bails. Strikethrough
+	// pairs additionally match first-come — a `~~` anywhere inside the
+	// core would close the wrap early.
+	const escapedMarkerChar = isTilde ? /\\~/.test(core) : /\\\*/.test(core);
+	const tildeInterior = isTilde && /~~/.test(core);
+	if (
+		escapedMarkerChar ||
+		tildeInterior ||
+		(isTilde ? leadRun > 0 || trailRun > 0 : leadRun !== trailRun)
+	) {
+		return null;
+	}
+	// Adjacency: a neighboring same-kind character — escaped or not, in
+	// either direction — merges into (or corrupts) the delimiter run.
+	if (lead === "" && before.endsWith(delimiterChar)) return null;
+	if (trail === "" && peekNextChar(next) === delimiterChar) return null;
+	// Interior delimiter runs (nested markers): the wrapper's opener can
+	// pair early with the first interior run when that run is
+	// closer-capable and CommonMark's rule of three doesn't block the
+	// pairing ("**" + interior "**" mispairs; "**" + "*" is blocked —
+	// which is why plain bold-with-italic content stays wrappable).
+	if (!isTilde && firstInteriorRunSteals(core, marker.length)) return null;
+	// Interior runs directly adjacent to punctuation corrupt marked's
+	// pairing regardless of CommonMark's flanking math (`*!**0**0*` and
+	// `*a**b**!*` fail while `**a*b*c**` and `**a *b* c**` pair fine).
+	if (!isTilde && interiorRunTouchesPunctuation(core)) return null;
+	// Raw inline tags combined with interior marker characters corrupt
+	// marked's run scanning (`*<c>**x**</c>*` fails to pair while
+	// `*<c>x</c>*` is fine). Text `<` is always escaped, so an unescaped
+	// `<` here is one of our own raw-tag emissions.
+	if (/(?<!\\)</.test(core) && (isTilde ? /~/ : /\*/).test(core)) {
+		return null;
+	}
+	// A trailing escape pair (e.g. `…\~`) corrupts marked's closing-run
+	// scan the same way escaped marker chars do.
+	if (/\\[\s\S]$/.test(core)) return null;
+	// CommonMark flanking (and marked applies the same rules to `~~`): a
+	// delimiter followed by punctuation only *opens* if preceded by
+	// whitespace/punctuation, and one preceded by punctuation only
+	// *closes* if followed by whitespace/punctuation.
+	{
+		const beforeChar = lead !== "" ? " " : before.slice(-1);
+		const afterChar = trail !== "" ? " " : peekNextChar(next);
+		const coreFirst = core.slice(0, 1);
+		const coreLast = core.slice(-1);
+		const openFails =
+			isPunctuation(coreFirst) &&
+			!(isFlankWhitespace(beforeChar) || isPunctuation(beforeChar));
+		const closeFails =
+			isPunctuation(coreLast) &&
+			!(isFlankWhitespace(afterChar) || isPunctuation(afterChar));
+		if (openFails || closeFails) return null;
+	}
 	return lead + marker + core + marker + trail;
+}
+
+/**
+ * Would the first interior `*`-run of `core` close against a wrapper
+ * opener of `markerLength` stars? Closer-capable = not preceded by
+ * whitespace and (not preceded by punctuation, or followed by
+ * whitespace/punctuation). The rule of three blocks the pairing when the
+ * combined lengths are a multiple of 3 (and the run lengths aren't).
+ */
+function firstInteriorRunSteals(core: string, markerLength: number): boolean {
+	for (const m of core.matchAll(/\*+/g)) {
+		const start = m.index ?? 0;
+		const end = start + m[0].length;
+		if (start === 0 || end === core.length) continue; // edge runs merge
+		const prev = core[start - 1] ?? "";
+		if (prev === "\\") return false; // escaped → already bailed upstream
+		const nextChar = core[end] ?? "";
+		const precededByWhitespace = /\s/.test(prev);
+		const precededByPunct = isPunctuation(prev);
+		const canClose =
+			!precededByWhitespace &&
+			(!precededByPunct || /\s/.test(nextChar) || isPunctuation(nextChar));
+		if (!canClose) return false; // first run opens; later runs pair inward
+		return (markerLength + m[0].length) % 3 !== 0;
+	}
+	return false;
+}
+
+/**
+ * True when any interior (non-edge) `*`-run has punctuation immediately
+ * on either side — the empirically unsafe shape in marked's emphasis
+ * pairing. (Whitespace- and alphanumeric-adjacent runs pair reliably.)
+ */
+function interiorRunTouchesPunctuation(core: string): boolean {
+	for (const m of core.matchAll(/\*+/g)) {
+		const start = m.index ?? 0;
+		const end = start + m[0].length;
+		if (start === 0 || end === core.length) continue; // edge runs merge
+		const prev = core[start - 1] ?? "";
+		const nextChar = core[end] ?? "";
+		if (isPunctuation(prev) || isPunctuation(nextChar)) return true;
+	}
+	return false;
+}
+
+/** Start/end of block counts as whitespace for flanking purposes. */
+function isFlankWhitespace(char: string): boolean {
+	return char === "" || /\s/.test(char);
+}
+
+function isPunctuation(char: string): boolean {
+	return /[\p{P}\p{S}]/u.test(char);
+}
+
+/**
+ * First character that will follow the current construct in the emitted
+ * markdown — used for flanking checks. Unknown elements return a
+ * conservative non-space, non-punctuation placeholder.
+ */
+function peekNextChar(next: DomNodeLike | undefined): string {
+	if (!next) return ""; // end of the inline run — block boundary
+	if (next.nodeType === TEXT_NODE) {
+		return (next.textContent ?? "").slice(0, 1);
+	}
+	if (next.nodeType === ELEMENT_NODE) {
+		const tag = (next as HtmlElementLike).tagName.toLowerCase();
+		if (tag === "br") return "\n";
+		// Unknown until serialized: treat as a letter so the flanking
+		// check stays conservative (more raw-tag fallbacks, never a broken
+		// delimiter).
+		return "a";
+	}
+	return "";
+}
+
+/**
+ * Fallback for emphasis that markdown delimiters can't express: emit the
+ * element as raw inline tags (all attributes preserved) around the
+ * markdown-escaped inner content. (Not `outerHTML` — marked reparses the
+ * text between raw inline tags as markdown, so unescaped `*`/`\` text
+ * characters would change structure on the next trip. The escaped
+ * serialization reparses to the identical DOM.)
+ */
+function rawInlineTag(el: HtmlElementLike, inner: string): string {
+	const tag = el.tagName.toLowerCase();
+	const attrs = (el.getAttributeNames?.() ?? [])
+		.map((name) => ` ${name}="${escapeHtmlAttr(el.getAttribute(name) ?? "")}"`)
+		.join("");
+	return `<${tag}${attrs}>${clampTagInner(inner)}</${tag}>`;
+}
+
+/** Emphasis wrap with the raw-tag fallback (see tryWrapDelimited). */
+function wrapOrRawTag(
+	el: HtmlElementLike,
+	inner: string,
+	marker: string,
+	before: string,
+	next: DomNodeLike | undefined,
+): string {
+	return (
+		tryWrapDelimited(inner, marker, before, next) ?? rawInlineTag(el, inner)
+	);
 }
 
 /**
@@ -637,13 +1240,21 @@ function serializeCodeSpan(text: string): string {
 }
 
 /**
- * A link can serialize as bare autolink text only when GFM would
+ * A link can serialize as bare autolink text only when marked would
  * re-linkify it identically: text === href (or mailto:text), a
  * conservative URL/email shape, a plain domain, and an end character
- * outside GFM's trailing-punctuation trim set.
+ * outside the trailing-punctuation trim set. marked's GFM text rule
+ * stops before `https?://` at ANY position, so URLs need no preceding
+ * boundary check.
  */
-function isBareAutolinkable(href: string, text: string): boolean {
+function isBareAutolinkable(
+	href: string,
+	text: string,
+	before: string,
+): boolean {
 	if (href === `mailto:${text}`) {
+		// marked only tokenizes an email after a non-local-part character.
+		if (/[A-Za-z0-9._+-]$/.test(before)) return false;
 		return /^[A-Za-z0-9._+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(text);
 	}
 	if (href !== text) return false;
@@ -653,22 +1264,46 @@ function isBareAutolinkable(href: string, text: string): boolean {
 	return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(domain);
 }
 
-/** GFM autolinks only start after whitespace, `(`, or a delimiter run. */
-function autolinkBoundaryBefore(out: string): boolean {
-	return out === "" || /[\s(*_~]$/.test(out);
-}
-
 /**
  * …and only end cleanly when followed by whitespace. A next sibling that
  * starts with anything else would be absorbed into the linkified URL.
  */
+/** Inline tags whose emission may start with markdown-active characters. */
+const ACTIVE_INLINE_TAGS = new Set(["a", "code", "img", "sup", "input"]);
+
+const EMPHASIS_TAGS = new Set(["strong", "b", "em", "i", "s", "strike", "del"]);
+
 function autolinkBoundaryAfter(next: DomNodeLike | undefined): boolean {
 	if (!next) return true; // end of the inline run — a block boundary follows
 	if (next.nodeType === TEXT_NODE) return /^\s/.test(next.textContent ?? "");
-	if (next.nodeType === ELEMENT_NODE) {
-		return (next as HtmlElementLike).tagName.toLowerCase() === "br";
+	// Comments emit `<`, which terminates marked's URL scan cleanly.
+	if (next.nodeType === COMMENT_NODE) return true;
+	if (next.nodeType !== ELEMENT_NODE) return false;
+	const el = next as HtmlElementLike;
+	const tag = el.tagName.toLowerCase();
+	if (tag === "br") return true;
+	if (ACTIVE_INLINE_TAGS.has(tag)) return false;
+	// Transparent wrappers contribute whatever their first child emits;
+	// emphasis wrappers hoist leading whitespace *outside* their markers —
+	// peek through both (vanishing wrappers are pre-filtered).
+	if (
+		tag === "div" ||
+		tag === "p" ||
+		tag === "span" ||
+		EMPHASIS_TAGS.has(tag)
+	) {
+		if (tag === "span") {
+			const style = el.getAttribute("style") ?? "";
+			if (/font-weight|font-style|text-decoration/i.test(style)) {
+				return false; // would emit emphasis markers first
+			}
+		}
+		const kids = arrayFrom(el.childNodes).filter((n) => !isVanishingNode(n));
+		if (kids.length === 0) return true; // emits raw tags: `<` ends the scan
+		return autolinkBoundaryAfter(kids[0]);
 	}
-	return false;
+	// Unknown elements rebuild as raw tags — `<` terminates the URL scan.
+	return true;
 }
 
 /**
@@ -684,16 +1319,24 @@ function escapeTrailingBang(out: string): string {
 }
 
 /**
- * Render a link/image destination. Destinations containing whitespace,
- * angle brackets, parens, or backslashes use the `<…>` form (with the
- * delimiters escaped) so they survive the trip through marked.
+ * Render a link/image destination. marked normalizes every destination
+ * through `cleanUrl` (encodeURI), so we pre-apply the identical
+ * transform — otherwise a non-ASCII destination comes back
+ * percent-encoded and the second trip differs from the first. What
+ * still contains parens/whitespace after encoding uses the `<…>` form.
  */
 function encodeLinkDestination(href: string): string {
-	if (href === "") return "<>";
-	if (/[\s<>()\\]/.test(href)) {
-		return `<${href.replace(/\n/g, " ").replace(/([<>\\])/g, "\\$1")}>`;
+	let encoded = href;
+	try {
+		encoded = encodeURI(href).replace(/%25/g, "%");
+	} catch {
+		// lone surrogates etc — marked would drop the link; keep raw.
 	}
-	return href;
+	if (encoded === "") return "<>";
+	if (/[\s<>()\\]/.test(encoded)) {
+		return `<${encoded.replace(/\n/g, " ").replace(/([<>\\])/g, "\\$1")}>`;
+	}
+	return encoded;
 }
 
 function escapeLinkTitle(title: string): string {
@@ -717,16 +1360,23 @@ function serializeCodeBlock(el: HtmlElementLike): string {
 	} else {
 		for (const cls of (code.getAttribute("class") ?? "").split(/\s+/)) {
 			if (cls.startsWith("language-")) {
-				// Info strings can't contain backticks or whitespace.
-				lang = cls.slice("language-".length).replace(/[`\s]/g, "");
+				// Info strings resolve backslash escapes (so escape ours) and
+				// can't contain backticks or whitespace.
+				lang = cls
+					.slice("language-".length)
+					.replace(/\\/g, "\\\\")
+					.replace(/[`\s]/g, "");
 				break;
 			}
 		}
 		text = code.textContent ?? "";
 	}
 	// marked emits a trailing newline inside <code>; strip exactly one so
-	// the fence doesn't grow a blank line every round trip.
+	// the fence doesn't grow a blank line every round trip. Whitespace-only
+	// content doesn't survive marked's fence trimming consistently —
+	// canonicalize it to an empty block.
 	text = text.replace(/\n$/, "");
+	if (text.trim() === "") text = "";
 	// A backtick run at a line start could close the fence early — use a
 	// longer fence than any run the content opens a line with.
 	let fenceLength = 3;
@@ -811,13 +1461,30 @@ function serializeFootnotes(el: HtmlElementLike): string {
  * middle of hyphenated words.
  */
 function escapeMarkdownText(text: string): string {
-	return text
-		.replace(/([\\`*_[\]~])/g, "\\$1")
-		.replace(/<(?=[a-zA-Z/!?])/g, "\\<")
-		.replace(
-			/&(?=[a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#[xX][0-9a-fA-F]{1,6};)/g,
-			"\\&",
-		);
+	return (
+		text
+			// `<` is escaped unconditionally: a `<` at a text-node edge can
+			// combine with whatever the *next* node emits (or break marked's
+			// emphasis scanning), and `\<` is stable in every context.
+			.replace(/([\\`*_[\]~<])/g, "\\$1")
+			.replace(
+				/&(?=[a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#[xX][0-9a-fA-F]{1,6};)/g,
+				"\\&",
+			)
+			// Defuse GFM extended autolinks: a bare URL/email in *text* (e.g.
+			// from raw HTML-block content) would come back as a link element.
+			// An escaped scheme colon / www dot / at-sign resolves to the same
+			// text but never linkifies. No word-boundary guard: GFM links
+			// after `_`/`*`/`~`/`(` too, which our escapes can put adjacent.
+			// (Anchor elements don't take this path — real self-links
+			// serialize as bare autolinks upstream.)
+			.replace(/(https?)(?=:\/\/)/gi, "$1\\")
+			.replace(/(www)(?=\.[A-Za-z0-9])/gi, "$1\\")
+			.replace(
+				/[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\\-]+(@)(?=[A-Za-z0-9-]+\.[A-Za-z0-9])/g,
+				(match) => match.replace(/@$/, "\\@"),
+			)
+	);
 }
 
 /** Array.from over the minimal ArrayLike the adapter types expose. */

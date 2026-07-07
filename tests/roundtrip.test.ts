@@ -72,7 +72,7 @@ const CANONICAL: Record<string, string> = {
 	"escaped specials": "a\\*b\\_c\\[d\\]e\\`f g\\~h\n",
 	"escaped line-start markers":
 		"\\# not a heading\n\n\\> not a quote\n\n\\- not a list\n\n1\\. not ordered\n",
-	"bare angle and amp where harmless": "5 < 6 and AT&T are fine\n",
+	"escaped angle bracket": "5 \\< 6 and AT&T are fine\n",
 	"escaped angle before letter": "left \\<b right\n",
 	"escaped entity": "literally \\&copy; here\n",
 	"comment separates adjacent lists": "- a\n\n<!-- -->\n\n- b\n",
@@ -128,6 +128,9 @@ const CONVERGENT: Record<string, string> = {
 	"pipe-heavy lines": "| looks | like | a | row |\n",
 	"comment block": "<!-- hidden -->\n\ntext\n",
 	"backslash at end of line": "line\\\nnext\n",
+	"bare angle bracket": "5 < 6 fine\n",
+	"unreferenced footnote def": "[^1]: orphan note\n",
+	"self-referential footnote": "[^a]: note[^a]\n",
 };
 
 describe("round-trip — canonical identity (guarantee 1)", () => {

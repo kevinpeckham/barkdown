@@ -50,6 +50,9 @@ export interface HtmlElementLike extends DomNodeLike {
 	readonly children: ArrayLike<HtmlElementLike>;
 	readonly outerHTML: string;
 	getAttribute(name: string): string | null;
+	/** Optional: used to rebuild unknown elements attribute-for-attribute;
+	 * without it the serializer falls back to `outerHTML`. */
+	getAttributeNames?(): string[];
 	hasAttribute(name: string): boolean;
 	querySelector(selectors: string): HtmlElementLike | null;
 	querySelectorAll(selectors: string): ArrayLike<HtmlElementLike>;

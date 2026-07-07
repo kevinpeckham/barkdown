@@ -183,17 +183,26 @@ describe("toMarkdown — footnotes", () => {
 	});
 
 	test("footnote section (legacy fn-N ids)", () => {
-		const html = `<p>See[^1]</p><section data-footnotes><ol><li id="fn-1">Source note</li></ol></section>`;
+		const html = `<p>See<sup data-footnote-ref="1">1</sup></p><section data-footnotes><ol><li id="fn-1">Source note</li></ol></section>`;
 		const result = toMarkdown(frag(html));
 		expect(result).toContain("[^1]: Source note");
 	});
 
 	test("footnote section (marked-footnote footnote-N ids)", () => {
-		const html = `<p>See[^1]</p><section class="footnotes" data-footnotes><h2 id="footnote-label" class="sr-only">Footnotes</h2><ol><li id="footnote-1"><p>Source note <a href="#footnote-ref-1" data-footnote-backref>↩</a></p></li></ol></section>`;
+		const html = `<p>See<sup><a id="footnote-ref-1" href="#footnote-1" data-footnote-ref>1</a></sup></p><section class="footnotes" data-footnotes><h2 id="footnote-label" class="sr-only">Footnotes</h2><ol><li id="footnote-1"><p>Source note <a href="#footnote-ref-1" data-footnote-backref>↩</a></p></li></ol></section>`;
 		const result = toMarkdown(frag(html));
 		expect(result).toContain("[^1]: Source note");
 		// The back-ref arrow must be stripped.
 		expect(result).not.toContain("↩");
+	});
+
+	test("unreferenced definitions are dropped (marked renders them to nothing)", () => {
+		const html = `<p>Literal [^1] text</p><section data-footnotes><ol><li id="fn-1">Orphan</li></ol></section>`;
+		const result = toMarkdown(frag(html));
+		// The paragraph's "[^1]" is escaped literal text, not a ref — the
+		// definition would vanish on the next trip, so it goes now.
+		expect(result).not.toContain("Orphan");
+		expect(result).toContain("\\[^1\\]");
 	});
 });
 
