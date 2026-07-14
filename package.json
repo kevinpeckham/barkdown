@@ -59,7 +59,7 @@
 		"linkedom": "^0.18.5",
 		"marked": "^18.0.5",
 		"marked-footnote": "^1.4.0",
-		"typescript": "^5.7.0",
+		"typescript": "^7.0.2",
 		"varlock": "^1.9.0"
 	},
 	"engines": {
